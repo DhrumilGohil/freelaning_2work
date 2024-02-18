@@ -6,7 +6,7 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
      # Ensure logs are delivered by CoudTrail
-      BucketName: !Sub "cloudtrail-loogs-${AWS::AccountId}" # Use descriptive naming
+      BucketName: !Sub "cloudtrail-logs-${AWS::AccountId}" # Use descriptive naming
       PublicAccessBlockConfiguration:
         BlockPublicAcls: False
         BlockPublicPolicy: False
@@ -46,7 +46,7 @@ Resources:
       IncludeGlobalServiceEvents: true 
       IsLogging: true
       IsMultiRegionTrail: True 
-      TrailName: !Sub "my-cloudtraill-${AWS::AccountId}"      
+      TrailName: !Sub "my-cloudtrail-${AWS::AccountId}"      
     
   LambdaExecutionRole:
     Type: "AWS::IAM::Role"
@@ -114,7 +114,7 @@ Resources:
               Service: states.amazonaws.com
             Action: 'sts:AssumeRole'
       Policies:
-        - PolicyName: StateMachineExecutionPolicyTest
+        - PolicyName: StateMachineExecutionPolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -158,7 +158,7 @@ Resources:
               Service: events.amazonaws.com
             Action: 'sts:AssumeRole'
       Policies:
-        - PolicyName: EventBridgeExecutionPolicytest
+        - PolicyName: EventBridgeExecutionPolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -172,9 +172,9 @@ Resources:
     Properties:
       EventPattern: |
         {
-          "source": ["ec2.amazonaws.com"],
           "detail-type": ["AWS API Call via CloudTrail"],
           "detail": {
+            "eventSource": ["ec2.amazonaws.com"],
             "eventName": ["RunInstances"]
           }
         }
