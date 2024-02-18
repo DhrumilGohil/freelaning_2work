@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for Slack notification on EC2 instance creation
+
+Resources:
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+     # Ensure logs are delivered by CoudTrail
+      BucketName: !Sub "cloudtrail-loogs-${AWS::AccountId}" # Use descriptive naming
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: False
+        BlockPublicPolicy: False
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: False
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: "AWSCloudTrailWrite"
+            Effect: Allow
+            Principal:
+              Service: 'cloudtrail.amazonaws.com' # Use service principal
+            Action: "s3:PutObject"
+            Resource: !Sub "arn:aws:s3:::${CloudTrailBucket}/*" # Include all objects
+          -
+            Sid: "AWSCloudTrailGetBucketAcl"
+            Effect: Allow
+            Principal:
+              Service: 'cloudtrail.amazonaws.com' # Use service principal
+            Action: "s3:GetBucketAcl"
+            Resource: !Sub "arn:aws:s3:::${CloudTrailBucket}"
+
+  CloudTrail:
+    DependsOn:
+      - CloudTrailBucketPolicy
+      - CloudTrailBucket
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      S3BucketName: !Ref CloudTrailBucket
+      S3KeyPrefix: !Sub "${AWS::AccountId}/"
+      IncludeGlobalServiceEvents: true 
+      IsLogging: true
+      IsMultiRegionTrail: True 
+      TrailName: !Sub "my-cloudtraill-${AWS::AccountId}"      
+    
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+
+  EC2InstanceNotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import os
+        
+          def lambda_handler(event, context):
+            
+              instanceId = event['detail']['responseElements']['instancesSet']['items'][0]['instanceId']
+              region = event['detail']['awsRegion']
+            
+              slack_message = {
+                  "text": f"New EC2 instance created with instance_id {instanceId} in region {region}"
+              }
+         
+              # Send message to Slack
+              send_slack_message(slack_message)
+            
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello from Lambda!')
+              }
+        
+          def send_slack_message(message):
+              slack_webhook_url = os.environ['SLACK_WEBHOOK_URL']  # Replace with your Slack webhook URL
+        
+              # Convert message to JSON
+              message_json = json.dumps(message).encode('utf-8')
+        
+              # Send message to Slack
+              req = urllib.request.Request(slack_webhook_url, data=message_json, headers={'Content-Type': 'application/json'})
+              response = urllib.request.urlopen(req)
+              print(response.read().decode('utf-8'))
+      Handler: "index.lambda_handler"
+      Runtime: "python3.11"
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: "YOUR_SLACK_WEBHOOK_URL"
+    
+  StatesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StateMachineExecutionPolicyTest
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt [EC2InstanceNotificationLambda, Arn]
+
+  WaitAndInvokeLambda:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      DefinitionString:
+        !Sub
+          - |-
+            {
+             "StartAt": "Wait20Seconds",
+             "States": {
+               "Wait20Seconds": {
+                 "Type": "Wait",
+                 "Seconds": 18000,
+                 "Next": "InvokeLambdaFunction"
+               },
+               "InvokeLambdaFunction": {
+                 "Type": "Task",
+                 "Resource": "${lambdaArn}",
+                 "End": true
+               }
+             }
+            }
+          - {lambdaArn: !GetAtt [ EC2InstanceNotificationLambda, Arn ]}
+      RoleArn: !GetAtt [ StatesExecutionRole, Arn ]
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: EventBridgeExecutionPolicytest
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource: !GetAtt [WaitAndInvokeLambda, Arn]
+  # EventBridge Rule
+  EC2InstanceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern: |
+        {
+          "source": ["ec2.amazonaws.com"],
+          "detail-type": ["AWS API Call via CloudTrail"],
+          "detail": {
+            "eventName": ["RunInstances"]
+          }
+        }
+      Targets:
+        - Id: "InvokeWaitAndInvokeLambda"
+          Arn: !GetAtt WaitAndInvokeLambda.Arn
+          RoleArn: !GetAtt EventBridgeRole.Arn
