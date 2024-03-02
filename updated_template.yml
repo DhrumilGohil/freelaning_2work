@@ -1,0 +1,322 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for Slack notification on EC2 instance creation
+
+Resources:
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+     # Ensure logs are delivered by CoudTrail
+      BucketName: !Sub "cloudtrail-logs-${AWS::AccountId}" # Use descriptive naming
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: False
+        BlockPublicPolicy: False
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: False
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: "AWSCloudTrailWrite"
+            Effect: Allow
+            Principal:
+              Service: 'cloudtrail.amazonaws.com' # Use service principal
+            Action: "s3:PutObject"
+            Resource: !Sub "arn:aws:s3:::${CloudTrailBucket}/*" # Include all objects
+          -
+            Sid: "AWSCloudTrailGetBucketAcl"
+            Effect: Allow
+            Principal:
+              Service: 'cloudtrail.amazonaws.com' # Use service principal
+            Action: "s3:GetBucketAcl"
+            Resource: !Sub "arn:aws:s3:::${CloudTrailBucket}"
+
+  CloudTrail:
+    DependsOn:
+      - CloudTrailBucketPolicy
+      - CloudTrailBucket
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      S3BucketName: !Ref CloudTrailBucket
+      S3KeyPrefix: !Sub "${AWS::AccountId}/"
+      IncludeGlobalServiceEvents: true 
+      IsLogging: true
+      IsMultiRegionTrail: True 
+      TrailName: !Sub "my-cloudtrail-${AWS::AccountId}"      
+    
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: LambdaLogPermission
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/testing:*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeInstances'
+                Resource: '*'
+
+
+  EC2InstanceNotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import os
+
+          def lambda_handler(event, context):
+              accountNumber = event['account']
+              userName = event['detail']['userIdentity']['sessionContext']['sessionIssuer']['userName']
+              instanceId = event['detail']['responseElements']['instancesSet']['items'][0]['instanceId']
+              region = event['detail']['awsRegion']
+              tagSet = event['detail']['requestParameters']['tagSpecificationSet']['items'][0]['tags']
+              for tag in tagSet:
+                  if tag['key'] == 'Name':
+                      instance_name = tag['value']
+                      break
+            
+              slack_message = {
+              "attachments": [
+                  {
+                      "color": "#36a64f",
+                      "pretext": "New EC2 instance created", 
+                      "fields": [
+                          {
+                              "title": "User Name",
+                              "value": f":information_source: {userName}",
+                              "short": True
+                          },
+                          {
+                              "title": "Region",
+                              "value": region,
+                              "short": True
+                          },
+                          {
+                              "title": "Account Number",
+                              "value": accountNumber,
+                              "short": True
+                          },
+                          {
+                              "title": "Instance ID",
+                              "value": instanceId,
+                              "short": True
+                          },
+                          {
+                              "title": "Instance Name",
+                              "value": instance_name,
+                              "short": True
+                          }
+                      ]
+                  }
+              ],
+              "text": "Don't forget to check if you are still using the EC2 instance you created with instance_id *{instanceId}* in region *{region}*"
+              }
+
+              # Send message to Slack
+              send_slack_message(slack_message)
+                
+              return {
+                'statusCode': 200,
+                'body': json.dumps('Hello from Lambda!')
+              }
+
+          def send_slack_message(message):
+              slack_webhook_url = os.environ['SLACK_WEBHOOK_URL']  # Replace with your Slack webhook URL
+              print(slack_webhook_url)
+              # Convert message to JSON
+              message_json = json.dumps(message).encode('utf-8')
+
+              # Send message to Slack
+              req = urllib.request.Request(slack_webhook_url, data=message_json, headers={'Content-Type': 'application/json'})
+              response = urllib.request.urlopen(req)
+              print(response.read().decode('utf-8'))
+      Handler: "index.lambda_handler"
+      Runtime: "python3.11"
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: "YOUR_SLACK_WEBHOOK_URL"
+    
+  StatesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StateMachineExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt [EC2InstanceNotificationLambda, Arn]
+
+  WaitAndInvokeLambda:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      DefinitionString:
+        !Sub
+          - |-
+            {
+             "StartAt": "Wait20Seconds",
+             "States": {
+               "Wait20Seconds": {
+                 "Type": "Wait",
+                 "Seconds": 18000,
+                 "Next": "InvokeLambdaFunction"
+               },
+               "InvokeLambdaFunction": {
+                 "Type": "Task",
+                 "Resource": "${lambdaArn}",
+                 "End": true
+               }
+             }
+            }
+          - {lambdaArn: !GetAtt [ EC2InstanceNotificationLambda, Arn ]}
+      RoleArn: !GetAtt [ StatesExecutionRole, Arn ]
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: EventBridgeExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource: !GetAtt [WaitAndInvokeLambda, Arn]
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource: !GetAtt [EC2ReminderNotificationLambda, Arn]
+  # EventBridge Rule
+  EC2InstanceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern: |
+        {
+          "detail-type": ["AWS API Call via CloudTrail"],
+          "detail": {
+            "eventSource": ["ec2.amazonaws.com"],
+            "eventName": ["RunInstances"] }
+        }
+      Targets:
+        - Id: "InvokeWaitAndInvokeLambda"
+          Arn: !GetAtt WaitAndInvokeLambda.Arn
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  ReminderRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DailyLambdaTrigger
+      ScheduleExpression: "cron(0 17 * * ? *)"  # This triggers at 9 AM PST (5 PM UTC)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EC2ReminderNotificationLambda.Arn
+          Id: "EC2ReminderNotificationLambda"
+    
+  EC2ReminderNotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.request
+          import os
+
+          def lambda_handler(event, context):
+              regions = [
+              "ap-southeast-1",
+              "ap-southeast-2",
+              "ca-central-1",
+              "eu-central-1",
+              "eu-north-1",
+              "eu-west-1",
+              "eu-west-2",
+              "us-east-1",
+              "us-east-2",
+              "us-west-1",
+              "us-west-2"
+              ]
+
+              for region in regions:
+                  ec2_client = boto3.client('ec2', region_name=region)
+                  instances = ec2_client.describe_instances()
+                  
+                  for reservation in instances['Reservations']:
+                      for instance in reservation['Instances']:
+                          user = ""
+                          instance_id = instance['InstanceId']
+                          for tag in instance.get('Tags', []):
+                              if tag['Key'] == 'User':
+                                  user = tag['Value']
+                          # Send message to Slack
+                          slack_message = {
+                            "text": f"Hello, *{user}*. "
+                          }
+
+                          send_slack_message(slack_message)
+                  
+          def send_slack_message(message):
+              slack_webhook_url = os.environ['SLACK_WEBHOOK_URL']  # Replace with your Slack webhook URL
+
+              # Convert message to JSON
+              message_json = json.dumps(message).encode('utf-8')
+
+              # Send message to Slack
+              req = urllib.request.Request(slack_webhook_url, data=message_json, headers={'Content-Type': 'application/json'})
+              response = urllib.request.urlopen(req)
+              print(response.read().decode('utf-8'))
+                      
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('EC2 instances creation reminder send successfully.')
+              }
+
+      Handler: "index.lambda_handler"
+      Runtime: "python3.11"
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: "YOUR_SLACK_WEBHOOK_URL" 
